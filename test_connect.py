@@ -1,265 +1,257 @@
 """
-DJI OSMO Gimbal BLE Test Script
-Tests connection, service discovery, and basic communication.
+DJI OSMO Gimbal BLE Control Script
+Connects via BLE and controls gimbal movement by sending
+auto-tracking coordinates (faking tracked object position).
 """
 import asyncio
+import struct
+import pygame
 from bleak import BleakClient, BleakScanner
 
 TARGET_NAME = "OMSE"
 
-# BLE handles from packet capture
-WRITE_HANDLE_UUID = None  # Will find by handle 0x0025
-NOTIFY_HANDLE_1 = None    # Handle 0x0022 equivalent
-NOTIFY_HANDLE_2 = None    # Handle 0x0014/0x0018 equivalents
+# --- DJI DUML Protocol ---
 
-# DJI DUML CRC-16 (CCITT)
+# CRC-16 table (DJI variant, init=0x3692, poly=0x8408)
 CRC16_TABLE = []
 def _init_crc16():
     for i in range(256):
         crc = i
         for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x8408
-            else:
-                crc >>= 1
+            crc = ((crc >> 1) ^ 0x8408) if (crc & 1) else (crc >> 1)
         CRC16_TABLE.append(crc & 0xFFFF)
 _init_crc16()
 
 def crc16(data):
-    crc = 0x3692  # DJI DUML init value
+    crc = 0x3692
     for b in data:
         crc = ((crc >> 8) & 0xFF) ^ CRC16_TABLE[(crc ^ b) & 0xFF]
     return crc & 0xFFFF
 
-def crc16_header(data):
-    """CRC for the 3-byte header (bytes 0-2)."""
-    crc = 0x3692
-    for b in data[:3]:
-        crc = ((crc >> 8) & 0xFF) ^ CRC16_TABLE[(crc ^ b) & 0xFF]
-    return crc & 0xFFFF
+
+# Constant middle section of tracking payload (bytes 5-19)
+# Extracted from captures - same across all tiltup/tiltdown packets
+TRACKING_CONST = bytes.fromhex("4e06000005d002020401000200000000")
+
+# Global state
+client = None
+write_uuid = None
+seq_counter = 0xD300  # Starting sequence number (arbitrary)
+last_encoder = 0xBCC6E3B4  # Default encoder position from captures
 
 
-def build_duml(sender, receiver, seq, flags, cmd_set, cmd_id, payload=b""):
-    """Build a complete DUML packet with CRC."""
-    total_len = 11 + len(payload) + 2  # header(11) + payload + crc(2)
+def notification_handler(sender, data):
+    """Parse gimbal notifications to extract encoder position."""
+    global last_encoder
+    # Look for movement command ACKs or telemetry
+    if len(data) > 11 and data[0] == 0x55:
+        pass  # Could parse encoder from telemetry here
 
-    # Bytes 0-2: SOF, length, version
-    b0 = 0x55
-    b1 = total_len & 0xFF
-    b2 = ((total_len >> 8) & 0x03) | (1 << 2)  # version=1
 
-    header = bytes([b0, b1, b2])
-    hcrc = crc16_header(header)
+def build_tracking_packet(target_y=0.5, target_x=0.5, box_w=0.057, box_h=0.058):
+    """Build a 49-byte DJI DUML tracking command.
 
+    target_y: Vertical position of 'tracked object' in frame (0.0=top, 1.0=bottom, 0.5=center)
+    target_x: Horizontal position (0.0=left, 1.0=right, 0.5=center)
+    box_w: Width of tracking box (normalized, ~0.057 from captures)
+    box_h: Height of tracking box (normalized, ~0.058 from captures)
+
+    The gimbal moves to CENTER the 'tracked object', so:
+    - target_y < 0.5 → gimbal tilts UP
+    - target_y > 0.5 → gimbal tilts DOWN
+    - target_x < 0.5 → gimbal pans LEFT
+    - target_x > 0.5 → gimbal pans RIGHT
+    """
+    global seq_counter, last_encoder
+
+    # DUML header
+    sof = 0x55
+    length = 49
+    version = 1
+    b1 = length & 0xFF
+    b2 = ((length >> 8) & 0x03) | (version << 2)
+    header = bytes([sof, b1, b2])
+    hcrc = crc16(header)
+
+    sender = 0x02  # App
+    receiver = 0x04  # Gimbal
+    seq = seq_counter
+    seq_counter = (seq_counter + 1) & 0xFFFF
+    flags = 0x40  # Request with ACK
+    cmd_set = 0x23  # Tracking command set
+    cmd_id = 0x09  # Movement command
+
+    # Build payload (36 bytes)
+    # Byte 0: checksum/counter byte (varies in captures, try 0x00)
+    # Bytes 1-4: 32-bit LE encoder position
+    # Bytes 5-19: constant config section
+    # Bytes 20-23: float Y (target vertical position)
+    # Bytes 24-27: float X (target horizontal position)
+    # Bytes 28-31: float W (tracking box width)
+    # Bytes 32-35: float H (tracking box height)
+
+    payload = bytearray(36)
+    payload[0] = 0x00  # Counter/checksum byte
+    struct.pack_into("<I", payload, 1, last_encoder)
+    payload[5:21] = TRACKING_CONST
+    struct.pack_into("<f", payload, 20, target_y)
+    struct.pack_into("<f", payload, 24, target_x)
+    struct.pack_into("<f", payload, 28, box_w)
+    struct.pack_into("<f", payload, 32, box_h)
+
+    # Assemble full packet
     pkt = bytearray(header)
-    pkt += hcrc.to_bytes(2, "little")
+    pkt += struct.pack("<H", hcrc)
     pkt.append(sender)
     pkt.append(receiver)
-    pkt += seq.to_bytes(2, "little")
+    pkt += struct.pack("<H", seq)
     pkt.append(flags)
     pkt.append(cmd_set)
     pkt.append(cmd_id)
     pkt += payload
 
+    # Packet CRC
     pcrc = crc16(pkt)
-    pkt += pcrc.to_bytes(2, "little")
+    pkt += struct.pack("<H", pcrc)
 
     return bytes(pkt)
 
 
-class DJIGimbalTest:
-    def __init__(self):
-        self.client = None
-        self.write_uuid = None
-        self.notify_uuids = []
-        self.seq = 0x0001
-        self.responses = []
+async def connect():
+    global client, write_uuid
 
-    def next_seq(self):
-        s = self.seq
-        self.seq = (self.seq + 1) & 0xFFFF
-        return s
+    print("Scanning for DJI gimbal...")
+    devices = await BleakScanner.discover(timeout=10)
 
-    def notification_handler(self, sender, data):
-        hex_str = data.hex()
-        # Parse DUML header if possible
-        if len(data) >= 11 and data[0] == 0x55:
-            length = data[1] | ((data[2] & 0x03) << 8)
-            snd = data[5]
-            rcv = data[6]
-            seq = int.from_bytes(data[7:9], "little")
-            flags = data[9]
-            cmd_set = data[10] if len(data) > 10 else "?"
-            cmd_id = data[11] if len(data) > 11 else "?"
-            flag_str = "RSP" if flags & 0x80 else "REQ"
-            print(f"  <- NOTIFY [{flag_str}] len={length} snd=0x{snd:02X} rcv=0x{rcv:02X} "
-                  f"seq=0x{seq:04X} set=0x{cmd_set:02X} id=0x{cmd_id:02X}")
-            if len(data) > 12:
-                payload = data[12:-2] if len(data) > 13 else data[12:]
-                print(f"     payload: {payload.hex()}")
-        else:
-            print(f"  <- RAW: {hex_str[:60]}{'...' if len(hex_str) > 60 else ''}")
-        self.responses.append(data)
+    target = None
+    for d in devices:
+        if d.name and TARGET_NAME in d.name:
+            target = d
+            print(f"  Found: {d.name} ({d.address})")
+            break
 
-    async def connect(self):
-        print(f"Scanning for {TARGET_NAME}...")
-        devices = await BleakScanner.discover(timeout=10)
+    if not target:
+        print("Device not found!")
+        return False
 
-        target = None
-        for d in devices:
-            if d.name and TARGET_NAME in d.name:
-                target = d
-                print(f"  Found: {d.name} ({d.address})")
-                break
+    print(f"Connecting to {target.name}...")
+    client = BleakClient(target.address)
+    await client.connect()
 
-        if not target:
-            print("Device not found!")
-            return False
+    if not client.is_connected:
+        print("Failed to connect!")
+        return False
 
-        print(f"Connecting to {target.name}...")
-        self.client = BleakClient(target.address)
-        await self.client.connect()
+    # Find write-without-response characteristic
+    print("Services:")
+    for service in client.services:
+        for char in service.characteristics:
+            props = ", ".join(char.properties)
+            print(f"  {char.uuid} handle={char.handle} [{props}]")
+            if "write-without-response" in char.properties and write_uuid is None:
+                write_uuid = char.uuid
+            if "notify" in char.properties:
+                try:
+                    await client.start_notify(char.uuid, notification_handler)
+                except:
+                    pass
 
-        if not self.client.is_connected:
-            print("Failed to connect!")
-            return False
+    print(f"Write UUID: {write_uuid}")
+    print("Connected!")
+    return True
 
-        print(f"Connected! Paired: {self.client.is_connected}")
 
-        # Discover services
-        print("\n=== Services & Characteristics ===")
-        write_candidates = []
-        notify_candidates = []
+async def send_tracking(target_y=0.5, target_x=0.5):
+    """Send a single tracking command."""
+    if not client or not write_uuid:
+        return
+    pkt = build_tracking_packet(target_y, target_x)
+    await client.write_gatt_char(write_uuid, pkt, response=False)
 
-        for service in self.client.services:
-            print(f"\nService: {service.uuid}")
-            for char in service.characteristics:
-                props = ", ".join(char.properties)
-                print(f"  {char.uuid} handle={char.handle} [{props}]")
 
-                if "write-without-response" in char.properties:
-                    write_candidates.append(char)
-                if "notify" in char.properties:
-                    notify_candidates.append(char)
+# --- Pygame GUI ---
+pygame.init()
+screen = pygame.display.set_mode((500, 500))
+pygame.display.set_caption("DJI OSMO Controller")
+font = pygame.font.SysFont(None, 24)
 
-        # Select characteristics
-        if write_candidates:
-            # Prefer handle closest to 0x0025 (37 decimal)
-            write_candidates.sort(key=lambda c: abs(c.handle - 37))
-            self.write_uuid = write_candidates[0].uuid
-            print(f"\n>> Using WRITE: {self.write_uuid} (handle={write_candidates[0].handle})")
-
-        # Enable notifications on all notify characteristics
-        for char in notify_candidates:
-            try:
-                await self.client.start_notify(char.uuid, self.notification_handler)
-                self.notify_uuids.append(char.uuid)
-                print(f">> Enabled NOTIFY: {char.uuid} (handle={char.handle})")
-            except Exception as e:
-                print(f">> Failed notify on {char.uuid}: {e}")
-
-        return True
-
-    async def send(self, data, label=""):
-        if not self.client or not self.write_uuid:
-            print("Not connected!")
-            return
-        hex_str = data.hex()
-        print(f"\n  -> SEND {label}: {hex_str[:60]}{'...' if len(hex_str) > 60 else ''}")
-        try:
-            await self.client.write_gatt_char(self.write_uuid, data, response=False)
-        except Exception as e:
-            print(f"     ERROR: {e}")
-
-    async def send_duml(self, cmd_set, cmd_id, payload=b"", flags=0x40, label=""):
-        """Build and send a DUML packet."""
-        seq = self.next_seq()
-        pkt = build_duml(0x02, 0x04, seq, flags, cmd_set, cmd_id, payload)
-        await self.send(pkt, label or f"CmdSet=0x{cmd_set:02X} CmdID=0x{cmd_id:02X}")
-
-    async def send_raw(self, hex_str, label=""):
-        """Send exact hex bytes from capture."""
-        data = bytes.fromhex(hex_str.replace(" ", ""))
-        await self.send(data, label)
-
-    async def test_connection(self):
-        """Run connection test sequence."""
-        print("\n" + "="*60)
-        print("PHASE 1: Listening for gimbal heartbeat...")
-        print("="*60)
-        await asyncio.sleep(3)
-
-        if self.responses:
-            print(f"\nReceived {len(self.responses)} notifications in 3 seconds")
-        else:
-            print("\nNo notifications received! Gimbal may not be sending telemetry.")
-
-        print("\n" + "="*60)
-        print("PHASE 2: Sending test commands...")
-        print("="*60)
-
-        # Test 1: Send a keepalive/ping (Command Set 0x00, ID 0x02 - common DUML ping)
-        self.responses.clear()
-        await self.send_duml(0x00, 0x02, label="Ping (CmdSet 0x00)")
-        await asyncio.sleep(0.5)
-
-        # Test 2: Try the exact captured keepalive format
-        # 550F 04A2 0227 XXXX 0000 0002 00 YY ZZ
-        await self.send_raw("550F04A20227010000000200000A3D", label="Keepalive (capture format)")
-        await asyncio.sleep(0.5)
-
-        # Test 3: Send a short status query (captured format)
-        await self.send_duml(0x04, 0x57, label="Status query (CmdSet 0x04)")
-        await asyncio.sleep(0.5)
-
-        # Test 4: Try movement command set
-        await self.send_duml(0x23, 0x09, payload=bytes(38), label="Movement cmd (zeros)")
-        await asyncio.sleep(1)
-
-        print(f"\nTotal responses after tests: {len(self.responses)}")
-
-        print("\n" + "="*60)
-        print("PHASE 3: Sending captured raw commands...")
-        print("="*60)
-
-        # Send exact captured init-like commands (non-truncated ones)
-        captured_cmds = [
-            ("550E04660204010040041022A59F", "Status query (0x10/0x22)"),
-            ("550E046602040200400410699970", "Status query (0x10/0x69)"),
-            ("550F04A2020403004000001139C6", "Config query"),
-        ]
-
-        for hex_cmd, label in captured_cmds:
-            self.responses.clear()
-            await self.send_raw(hex_cmd, label)
-            await asyncio.sleep(0.5)
-            if self.responses:
-                print(f"  Got {len(self.responses)} response(s)!")
-
-    async def disconnect(self):
-        if self.client:
-            await self.client.disconnect()
-            print("\nDisconnected.")
+joystick_center = (300, 300)
+radius = 120
 
 
 async def main():
-    gimbal = DJIGimbalTest()
+    running = True
+    connected = False
 
-    if not await gimbal.connect():
-        return
+    while running:
+        screen.fill((30, 30, 30))
 
-    try:
-        await gimbal.test_connection()
+        # Status
+        status = "CONNECTED" if connected else "DISCONNECTED"
+        color = (0, 200, 0) if connected else (200, 0, 0)
+        screen.blit(font.render(status, True, color), (20, 20))
 
-        print("\n" + "="*60)
-        print("Test complete. Press Ctrl+C to exit or wait 10s...")
-        print("="*60)
-        await asyncio.sleep(10)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await gimbal.disconnect()
+        # Connect button
+        btn_connect = pygame.Rect(20, 50, 120, 40)
+        pygame.draw.rect(screen, (0, 120, 80) if connected else (80, 80, 80), btn_connect)
+        screen.blit(font.render("Connect", True, (255, 255, 255)), (35, 60))
+
+        # Joystick
+        pygame.draw.circle(screen, (60, 60, 60), joystick_center, radius, 2)
+        pygame.draw.line(screen, (40, 40, 40), (joystick_center[0] - radius, joystick_center[1]),
+                         (joystick_center[0] + radius, joystick_center[1]), 1)
+        pygame.draw.line(screen, (40, 40, 40), (joystick_center[0], joystick_center[1] - radius),
+                         (joystick_center[0], joystick_center[1] + radius), 1)
+
+        # Labels
+        screen.blit(font.render("Tilt Up", True, (150, 150, 150)),
+                     (joystick_center[0] - 25, joystick_center[1] - radius - 25))
+        screen.blit(font.render("Tilt Down", True, (150, 150, 150)),
+                     (joystick_center[0] - 35, joystick_center[1] + radius + 10))
+        screen.blit(font.render("Pan L", True, (150, 150, 150)),
+                     (joystick_center[0] - radius - 50, joystick_center[1] - 10))
+        screen.blit(font.render("Pan R", True, (150, 150, 150)),
+                     (joystick_center[0] + radius + 10, joystick_center[1] - 10))
+
+        mouse = pygame.mouse.get_pos()
+        pressed = pygame.mouse.get_pressed()[0]
+
+        target_y = 0.5
+        target_x = 0.5
+
+        if pressed and connected:
+            dx = mouse[0] - joystick_center[0]
+            dy = mouse[1] - joystick_center[1]
+            dx = max(-radius, min(radius, dx))
+            dy = max(-radius, min(radius, dy))
+
+            pygame.draw.circle(screen, (0, 200, 255),
+                               (joystick_center[0] + dx, joystick_center[1] + dy), 12)
+
+            # Map joystick to tracking coordinates
+            # Joystick right → object to the right → X > 0.5
+            # Joystick up → object above → Y < 0.5
+            target_x = 0.5 + (dx / radius) * 0.3  # ±0.3 from center
+            target_y = 0.5 + (dy / radius) * 0.3  # ±0.3 from center
+
+            await send_tracking(target_y, target_x)
+
+        # Debug info
+        screen.blit(font.render(f"Target Y={target_y:.3f}  X={target_x:.3f}",
+                                True, (200, 200, 200)), (20, 460))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if btn_connect.collidepoint(event.pos):
+                    connected = await connect()
+
+        pygame.display.flip()
+        await asyncio.sleep(0.04)  # ~25 Hz (matching capture rate)
+
+    if client:
+        await client.disconnect()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
